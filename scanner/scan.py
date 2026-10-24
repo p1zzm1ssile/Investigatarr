@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -25,11 +26,16 @@ SEV_ORDER = ["critical", "high", "medium", "low", "info"]
 
 findings = []
 secrets = {}  # password value -> ["container:VAR", ...], filled by check_docker
+containers_seen = []  # {"name", "running", "finished", "binds"}, filled by check_docker
+cleanup = []  # clutter found by check_cleanup; listed in the report, never scored
+lock = threading.RLock()
+last_scan = {}
 
 
 def add(check_id, severity, title, detail, fix):
-    findings.append({"id": check_id, "severity": severity, "title": title,
-                     "detail": detail, "fix": fix})
+    # key identifies a finding across scans so it can be dismissed
+    findings.append({"id": check_id, "key": "%s|%s" % (check_id, title), "severity": severity,
+                     "title": title, "detail": detail, "fix": fix})
 
 
 def hp(*parts):
@@ -195,6 +201,9 @@ def check_docker():
             continue
         count += 1
         name = cfg.get("Name", d[-12:]).lstrip("/")
+        containers_seen.append({"name": name, "running": cfg.get("State", {}).get("Running", False),
+                                "finished": cfg.get("State", {}).get("FinishedAt", ""),
+                                "binds": [b.split(":")[0] for b in hc.get("Binds") or []]})
         if "investigatarr" in name.lower():
             continue
         running = cfg.get("State", {}).get("Running", False)
@@ -287,6 +296,138 @@ def check_password_reuse():
                 "Give each user their own password under Users.")
 
 
+def check_upnp_apps():
+    """Apps that ask the router to open ports through UPnP / NAT-PMP."""
+    appdata = hp("mnt/user/appdata")
+
+    def find(name):
+        out = []
+        for depth in ("*", "*/*", "*/*/*"):
+            out += glob.glob(os.path.join(appdata, depth, name))
+        return out
+
+    hits = []
+    for path in find("qBittorrent.conf"):
+        if not re.search(r"^(Connection\\|Session\\)UPnP=false", read(path) or "", re.M | re.I):
+            hits.append(("qBittorrent", path, "Tools > Options > Connection > untick 'Use UPnP / NAT-PMP'"))
+    for path in find("core.conf"):
+        text = read(path) or ""
+        if '"listen_ports"' in text and not re.search(r'"upnp":\s*false', text):
+            hits.append(("Deluge", path, "Preferences > Network > untick UPnP and NAT-PMP"))
+    for path in find("settings.json"):
+        text = read(path) or ""
+        if '"rpc-port"' in text and not re.search(r'"port-forwarding-enabled":\s*false', text):
+            hits.append(("Transmission", path, "Preferences > Network > untick 'Use port forwarding from my router'"))
+    for path in find("config.xml"):
+        text = read(path) or ""
+        if "<natEnabled>true</natEnabled>" in text:
+            hits.append(("Syncthing", path, "Settings > Connections > untick 'Enable NAT traversal'"))
+    for app, path, fix in hits:
+        add("upnp.app", "medium", "%s can open router ports with UPnP" % app,
+            "Its settings (%s) let it forward ports on your router without asking." % tidy(path),
+            fix + ", and forward the port by hand. If you use a VPN container, forward it there instead.")
+
+
+def local_ips():
+    ips = set()
+    try:
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("192.0.2.1", 9))  # no packet is sent; this picks the LAN address
+        ips.add(sock.getsockname()[0])
+        sock.close()
+    except OSError:
+        pass
+    return ips
+
+
+def soap(url, service, action, args=""):
+    import urllib.request
+    body = ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>'
+            '<u:%s xmlns:u="%s">%s</u:%s></s:Body></s:Envelope>' % (action, service, args, action))
+    req = urllib.request.Request(url, body.encode(), {
+        "Content-Type": 'text/xml; charset="utf-8"', "SOAPAction": '"%s#%s"' % (service, action)})
+    with urllib.request.urlopen(req, timeout=4) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def router_mappings():
+    """Ask the router (UPnP IGD) for its port forwards. Returns [] if it doesn't answer."""
+    import socket
+    import urllib.parse
+    import urllib.request
+    location = os.environ.get("ROUTER_UPNP_URL", "")
+    if not location:
+        msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n"
+               "MX: 2\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(3)
+        try:
+            sock.sendto(msg.encode(), ("239.255.255.250", 1900))
+            data = sock.recv(4096).decode("utf-8", "replace")
+            m = re.search(r"^location:\s*(\S+)", data, re.I | re.M)
+            location = m.group(1) if m else ""
+        except OSError:
+            return []
+        finally:
+            sock.close()
+    if not location:
+        return []
+    try:
+        with urllib.request.urlopen(location, timeout=4) as r:
+            desc = r.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    for svc in re.findall(r"<service>(.*?)</service>", desc, re.S):
+        stype = re.search(r"<serviceType>\s*(.*?)\s*</serviceType>", svc)
+        ctrl = re.search(r"<controlURL>\s*(.*?)\s*</controlURL>", svc)
+        if stype and ctrl and re.search(r"WAN(IP|PPP)Connection", stype.group(1)):
+            break
+    else:
+        return []
+    url, service, out = urllib.parse.urljoin(location, ctrl.group(1)), stype.group(1), []
+    for i in range(256):
+        try:
+            resp = soap(url, service, "GetGenericPortMappingEntry",
+                        "<NewPortMappingIndex>%d</NewPortMappingIndex>" % i)
+        except Exception:
+            break  # the router answers the first index past the end with a fault
+        def tag(t):
+            m = re.search(r"<%s>(.*?)</%s>" % (t, t), resp, re.S)
+            return m.group(1).strip() if m else ""
+        out.append({"external": tag("NewExternalPort"), "protocol": tag("NewProtocol"),
+                    "client": tag("NewInternalClient"), "internal": tag("NewInternalPort"),
+                    "description": tag("NewPortMappingDescription")})
+    return out
+
+
+def check_router_upnp():
+    if os.environ.get("ROUTER_UPNP", "1") == "0":
+        return
+    ident = read_cfg(os.path.join(BOOT, "config/ident.cfg")) or {}
+    webui = {ident.get("PORT", "80"), ident.get("PORTSSL", "443")}
+    ssh = ident.get("PORTSSH", "22")
+    mine = local_ips()
+    for m in router_mappings():
+        if mine and m["client"] not in mine:
+            continue
+        what = "%s/%s" % (m["external"], m["protocol"])
+        via = " (opened by '%s')" % m["description"] if m["description"] else ""
+        if m["internal"] in webui:
+            add("router.webui", "critical", "Unraid web UI is open to the internet on port %s" % m["external"],
+                "Your router forwards %s to the web UI%s. Anyone online can try to log in." % (what, via),
+                "Delete this forward on your router and use WireGuard or Tailscale for remote access.")
+        elif m["internal"] == ssh:
+            add("router.ssh", "high", "SSH is open to the internet on port %s" % m["external"],
+                "Your router forwards %s to SSH%s." % (what, via),
+                "Delete this forward and use a VPN for remote SSH.")
+        else:
+            add("router.forward", "low", "Router forwards port %s to this server%s" % (what, via),
+                "It points at internal port %s. Fine if you meant it, for example a torrent port." % m["internal"],
+                "Check you still need it. Dismiss this if it's intentional.")
+
+
 def check_listening():
     exposed = []
     risky_ports = {21: "FTP", 23: "Telnet", 111: "rpcbind", 139: "NetBIOS",
@@ -339,9 +480,109 @@ def check_vms():
     return count
 
 
+# ---------------------------------------------------------------- cleanup
+
+def tidy(path):
+    """Show a host path the way the user sees it on Unraid."""
+    return "/" + os.path.relpath(path, HOST) if path.startswith(HOST) else path
+
+
+def dir_size(path, limit=100000):
+    total, n, stack = 0, 0, [path]
+    while stack and n < limit:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    n += 1
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return total
+
+
+def add_cleanup(kind, title, path, size, detail):
+    cleanup.append({"kind": kind, "key": "%s|%s" % (kind, tidy(path)), "title": title,
+                    "path": tidy(path), "size": size, "detail": detail})
+
+
+def check_cleanup():
+    days = int(os.environ.get("CLEANUP_STOPPED_DAYS", "30") or 30)
+    now = datetime.now(timezone.utc)
+    for c in containers_seen:
+        if c["running"] or not c["finished"] or c["finished"].startswith("0001"):
+            continue
+        try:
+            stopped = datetime.strptime(c["finished"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        age = (now - stopped).days
+        if age >= days:
+            add_cleanup("container", "Container '%s' stopped %d days ago" % (c["name"], age),
+                        "docker:" + c["name"], 0,
+                        "Remove it from the Docker tab if you no longer use it.")
+
+    # appdata folders that no container (running or stopped) maps
+    used = {c["name"].lower() for c in containers_seen}
+    for c in containers_seen:
+        for b in c["binds"]:
+            m = re.match(r"/mnt/[^/]+/appdata/([^/]+)", b)
+            if m:
+                used.add(m.group(1).lower())
+    for appdata in sorted(set(glob.glob(hp("mnt/user/appdata")) + glob.glob(hp("mnt/*/appdata")))):
+        if "/mnt/user/" not in appdata and os.path.isdir(hp("mnt/user/appdata")):
+            continue  # pools are already merged into /mnt/user
+        for e in sorted(os.listdir(appdata)):
+            full = os.path.join(appdata, e)
+            if os.path.isdir(full) and e.lower() not in used:
+                add_cleanup("appdata", "appdata/%s is not used by any container" % e, full,
+                            dir_size(full), "Left behind by a container that was removed.")
+
+    # shares with nothing in them, and empty files / folders inside shares
+    max_entries = int(os.environ.get("CLEANUP_MAX_FILES", "500000") or 500000)
+    seen = 0
+    for cfg in sorted(glob.glob(os.path.join(BOOT, "config/shares/*.cfg"))):
+        name = os.path.splitext(os.path.basename(cfg))[0]
+        root = hp("mnt/user", name)
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            entries = []
+        if not entries:
+            add_cleanup("share", "Share '%s' is empty" % name, root, 0,
+                        "Delete it under Shares if you don't need it.")
+            continue
+        if name in ("appdata", "system", "domains", "isos"):
+            continue  # apps and VMs keep empty placeholder files on purpose
+        empty_files, empty_dirs = [], []
+        for dirpath, dirnames, filenames in os.walk(root):
+            seen += len(dirnames) + len(filenames)
+            if seen > max_entries:
+                break
+            if not dirnames and not filenames:
+                empty_dirs.append(dirpath)
+            for fn in filenames:
+                try:
+                    if os.lstat(os.path.join(dirpath, fn)).st_size == 0:
+                        empty_files.append(os.path.join(dirpath, fn))
+                except OSError:
+                    pass
+        for label, items in (("empty file", empty_files), ("empty folder", empty_dirs)):
+            if items:
+                label += "s" if len(items) > 1 else ""
+                sample = ", ".join(tidy(x) for x in items[:5])
+                add_cleanup("empty", "%d %s in share '%s'" % (len(items), label, name), root, 0,
+                            "For example: %s%s" % (sample, " …" if len(items) > 5 else ""))
+
+
 # ---------------------------------------------------------------- scoring + report
 
-def score():
+def score(findings):
     # Repeats of the same check count half, so one widespread habit
     # (e.g. ten root containers) doesn't outweigh a single critical issue.
     s, seen = 100.0, {}
@@ -354,6 +595,34 @@ def score():
     if any(f["severity"] == "critical" for f in findings) and grade in ("A", "B"):
         grade = "C"  # a critical issue caps the grade
     return s, grade
+
+
+def load_dismissed():
+    try:
+        with open(os.path.join(OUT, "dismissed.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def set_dismissed(key, dismiss):
+    with lock:
+        d = load_dismissed()
+        if dismiss:
+            d[key] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        else:
+            d.pop(key, None)
+        with open(os.path.join(OUT, "dismissed.json"), "w") as f:
+            json.dump(d, f, indent=2)
+        if last_scan:
+            publish(**last_scan)
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1024.0
 
 
 def write_exports(report):
@@ -380,82 +649,154 @@ def write_exports(report):
 def render_html(report):
     colors = {"critical": "#b91c1c", "high": "#c2410c", "medium": "#a16207",
               "low": "#1d4ed8", "info": "#4b5563"}
-    rows = []
-    for f in report["findings"]:
-        rows.append(
-            "<tr><td><span class='sev' style='background:%s'>%s</span></td>"
-            "<td><b>%s</b><div class='d'>%s</div><div class='fix'>Fix: %s</div></td></tr>"
-            % (colors[f["severity"]], f["severity"], html.escape(f["title"]),
-               html.escape(f["detail"]), html.escape(f["fix"])))
+
+    def row(f, dismissed=False):
+        btn = ("<button class='act' data-key='%s' data-on='%d'>%s</button>"
+               % (html.escape(f["key"], quote=True), 0 if dismissed else 1,
+                  "Restore" if dismissed else "Dismiss"))
+        return ("<tr%s><td><span class='sev' style='background:%s'>%s</span></td>"
+                "<td><b>%s</b><div class='d'>%s</div><div class='fix'>Fix: %s</div></td><td>%s</td></tr>"
+                % (" class='dim'" if dismissed else "", colors[f["severity"]], f["severity"],
+                   html.escape(f["title"]), html.escape(f["detail"]), html.escape(f["fix"]), btn))
+
+    rows = "".join(row(f) for f in report["findings"]) or "<tr><td>No issues found.</td></tr>"
+    dismissed = ""
+    if report["dismissed"]:
+        dismissed = ("<h2>Dismissed (%d)</h2><p class='meta'>Not counted in your score.</p><table>%s</table>"
+                     % (len(report["dismissed"]), "".join(row(f, True) for f in report["dismissed"])))
+    clean = ""
+    if report["cleanup"]:
+        total = sum(c["size"] for c in report["cleanup"])
+        clean = ("<h2>Cleanup (%d)</h2><p class='meta'>Clutter found on the server%s. Not counted in your score.</p><table>%s</table>"
+                 % (len(report["cleanup"]), ", %s reclaimable" % human_size(total) if total else "",
+                    "".join("<tr><td><span class='sev' style='background:#475569'>%s</span></td>"
+                            "<td><b>%s</b><div class='d'>%s</div><div class='d'><code>%s</code></div></td><td>%s</td></tr>"
+                            % (c["kind"], html.escape(c["title"]), html.escape(c["detail"]),
+                               html.escape(c["path"]), human_size(c["size"]) if c["size"] else "")
+                            for c in report["cleanup"])))
     counts = " · ".join("%s %d" % (k, report["counts"][k]) for k in SEV_ORDER if report["counts"][k])
     return """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="300">
 <title>Investigatarr Report</title><style>
 body{font-family:system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0 16px;background:#f8fafc;color:#0f172a}
 .score{font-size:64px;font-weight:700}.grade{font-size:28px;margin-left:12px}
 table{width:100%%;border-collapse:collapse;background:#fff}td{border-top:1px solid #e2e8f0;padding:10px;vertical-align:top}
+td:last-child{text-align:right;white-space:nowrap}h2{margin-top:32px}
 .sev{color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;text-transform:uppercase}
-.export{float:right;margin-top:28px;font-size:14px}.export a,.export button{margin-left:8px;padding:6px 10px;border:1px solid #94a3b8;border-radius:6px;background:transparent;color:inherit;text-decoration:none;font:inherit;cursor:pointer}
-@media print{.export{display:none}body{background:#fff;color:#000}}
+.export{float:right;margin-top:28px;font-size:14px}button,.export a{margin-left:8px;padding:6px 10px;border:1px solid #94a3b8;border-radius:6px;background:transparent;color:inherit;text-decoration:none;font:inherit;font-size:14px;cursor:pointer}
+.dim{opacity:.6}code{font-size:12px;word-break:break-all}
+@media print{.export,.act{display:none}body{background:#fff;color:#000}}
 .d{color:#475569;margin-top:4px}.fix{color:#065f46;margin-top:4px}.meta{color:#64748b}
 @media(prefers-color-scheme:dark){body{background:#0f172a;color:#e2e8f0}table{background:#1e293b}td{border-color:#334155}.d{color:#94a3b8}.fix{color:#6ee7b7}}
 </style></head><body>
 <nav class="export">Export:
-<a href="report.csv" download>CSV</a><a href="report.md" download>Markdown</a><a href="report.json" download>JSON</a><button onclick="window.print()">Print / PDF</button></nav>
+<a href="report.csv" download>CSV</a><a href="report.md" download>Markdown</a><a href="report.json" download>JSON</a><button onclick="window.print()">Print / PDF</button><button id="rescan">Rescan now</button></nav>
 <h1><img src="icon.png" alt="" width="56" height="56" style="vertical-align:middle;border-radius:8px;margin-right:10px">Investigatarr</h1>
 <div><span class="score">%d</span><span class="grade">/ 100 &nbsp; Grade %s</span></div>
 <p class="meta">%s · Unraid %s · %d containers · %d VMs · scanned %s</p>
-<table>%s</table></body></html>""" % (
+<table>%s</table>%s%s
+<script>
+async function post(url, body) {
+  try {
+    const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+    if (!r.ok) throw new Error(r.status);
+    location.reload();
+  } catch (e) { alert("Couldn't reach Investigatarr (" + e.message + ")."); }
+}
+document.querySelectorAll("button.act").forEach(b => b.onclick = () =>
+  post("api/dismiss", {key: b.dataset.key, dismiss: b.dataset.on === "1"}));
+document.getElementById("rescan").onclick = e => { e.target.textContent = "Scanning…"; post("api/rescan"); };
+</script></body></html>""" % (
         report["score"], report["grade"], counts or "no issues found",
         html.escape(str(report["unraid_version"])), report["containers"], report["vms"],
-        report["scanned_at"], "".join(rows) or "<tr><td>No issues found.</td></tr>")
+        report["scanned_at"], rows, dismissed, clean)
+
+
+def publish(found, cleanup_items, meta):
+    """Apply dismissals, score and write every report file."""
+    with lock:
+        dismissed = load_dismissed()
+        active = [f for f in found if f["key"] not in dismissed]
+        hidden = [f for f in found if f["key"] in dismissed]
+        s, grade = score(active)
+        report = dict(meta, score=s, grade=grade,
+                      counts={k: sum(1 for f in active if f["severity"] == k) for k in SEV_ORDER},
+                      findings=active, dismissed=hidden, cleanup=cleanup_items)
+        os.makedirs(OUT, exist_ok=True)
+        icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+        if os.path.exists(icon):
+            shutil.copyfile(icon, os.path.join(OUT, "icon.png"))
+        with open(os.path.join(OUT, "report.json"), "w") as f:
+            json.dump(report, f, indent=2)
+        write_exports(report)
+        with open(os.path.join(OUT, "index.html"), "w") as f:
+            f.write(render_html(report))
+        return report
 
 
 def run_scan():
-    findings.clear()
-    if not os.path.isdir(os.path.join(BOOT, "config")):
-        sys.exit("Cannot see %s/config. Mount the host root read-only: -v /:/host:ro,rslave" % BOOT)
-    version = check_version()
-    check_root_password()
-    check_management_access()
-    check_shares()
-    secrets.clear()
-    containers = check_docker()
-    check_password_reuse()
-    ports = check_listening()
-    plugins = check_plugins()
-    vms = check_vms()
-    findings.sort(key=lambda f: SEV_ORDER.index(f["severity"]))
-    s, grade = score()
-    report = {
-        "score": s, "grade": grade,
-        "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "unraid_version": version, "containers": containers, "vms": vms,
-        "plugins": plugins, "listening_ports": ports,
-        "counts": {k: sum(1 for f in findings if f["severity"] == k) for k in SEV_ORDER},
-        "findings": findings,
-    }
-    os.makedirs(OUT, exist_ok=True)
-    icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
-    if os.path.exists(icon):
-        shutil.copyfile(icon, os.path.join(OUT, "icon.png"))
-    with open(os.path.join(OUT, "report.json"), "w") as f:
-        json.dump(report, f, indent=2)
-    write_exports(report)
-    with open(os.path.join(OUT, "index.html"), "w") as f:
-        f.write(render_html(report))
-    print("Investigatarr score: %d/100 (grade %s)" % (s, grade))
-    for f in findings:
+    with lock:
+        findings.clear()
+        cleanup.clear()
+        secrets.clear()
+        containers_seen.clear()
+        if not os.path.isdir(os.path.join(BOOT, "config")):
+            sys.exit("Cannot see %s/config. Mount the host root read-only: -v /:/host:ro,rslave" % BOOT)
+        version = check_version()
+        check_root_password()
+        check_management_access()
+        check_shares()
+        containers = check_docker()
+        check_password_reuse()
+        check_upnp_apps()
+        ports = check_listening()
+        check_router_upnp()
+        plugins = check_plugins()
+        vms = check_vms()
+        check_cleanup()
+        findings.sort(key=lambda f: SEV_ORDER.index(f["severity"]))
+        meta = {"scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "unraid_version": version, "containers": containers, "vms": vms,
+                "plugins": plugins, "listening_ports": ports}
+        last_scan.update(found=list(findings), cleanup_items=list(cleanup), meta=meta)
+        report = publish(**last_scan)
+    print("Investigatarr score: %d/100 (grade %s)" % (report["score"], report["grade"]))
+    for f in report["findings"]:
         print("  [%-8s] %s" % (f["severity"].upper(), f["title"]))
+    if report["dismissed"]:
+        print("  (%d dismissed)" % len(report["dismissed"]))
+    if report["cleanup"]:
+        print("  %d cleanup items" % len(report["cleanup"]))
     return report
 
 
 def serve(port):
     import functools
     import http.server
-    import threading
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=OUT)
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            # Requiring JSON stops other websites from posting here behind your back
+            if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                return self.send_error(415)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(min(n, 65536)) or b"{}")
+            except ValueError:
+                return self.send_error(400)
+            if self.path.rstrip("/").endswith("/api/dismiss") and isinstance(body.get("key"), str):
+                set_dismissed(body["key"][:500], bool(body.get("dismiss", True)))
+            elif self.path.rstrip("/").endswith("/api/rescan"):
+                run_scan()
+            else:
+                return self.send_error(404)
+            self.send_response(204)
+            self.end_headers()
+
+    handler = functools.partial(Handler, directory=OUT)
     httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print("Report served on port %d" % port)

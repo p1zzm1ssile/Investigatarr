@@ -15,12 +15,28 @@ A small container that audits an Unraid server and gives it a security score out
 | Docker | Privileged containers, risky capabilities, Docker socket mounts, writable host-system mounts, host networking, running as root, default passwords in env vars |
 | Password reuse | Same secret in several containers, root password reused in a container env var, Samba users sharing a password (values are never written to the report) |
 | VMs | VNC consoles with no password |
+| UPnP | Unraid's UPnP setting, torrent and sync apps that open router ports themselves (qBittorrent, Deluge, Transmission, Syncthing), and the port forwards your router actually has pointing at the server (asked over UPnP). A forwarded web UI or SSH port is flagged as critical / high |
 | Network | Risky services listening on all interfaces (Telnet, FTP, Docker API 2375, databases, Redis, VNC…) |
 | Plugins | Large plugin count |
 
 ## Scoring
 
 Start at 100. Each finding subtracts: critical 25, high 12, medium 6, low 2. Repeats of the same check count half (and stop counting after the third) so one habit across many containers doesn't drown everything else. Any critical finding caps the grade at C. Grades: A ≥ 90, B ≥ 80, C ≥ 70, D ≥ 60, F below.
+
+## Dismissing findings
+
+Each finding has a **Dismiss** button. A dismissed finding moves to a *Dismissed* section, stops counting against your score and stays dismissed on later scans; **Restore** brings it back. Dismissals are saved in `/output/dismissed.json`.
+
+## Cleanup
+
+The report also lists clutter, without scoring it:
+
+- containers stopped for more than `CLEANUP_STOPPED_DAYS` days (default 30)
+- appdata folders no container maps any more, with their size
+- empty shares
+- empty files and folders inside shares (appdata, system, domains and isos are skipped; the walk stops after `CLEANUP_MAX_FILES` entries, default 500000)
+
+Investigatarr only lists these. It never deletes anything.
 
 ## Output
 
@@ -48,7 +64,7 @@ docker run -d --name investigatarr --net=host \
   ghcr.io/p1zzm1ssile/investigatarr:latest
 ```
 
-Set `SCAN_INTERVAL_HOURS=0` for a one-shot scan (`FAIL_BELOW=70` makes it exit non-zero under that score, handy for User Scripts).
+Set `ROUTER_UPNP=0` to skip asking the router for its port forwards. Set `SCAN_INTERVAL_HOURS=0` for a one-shot scan (`FAIL_BELOW=70` makes it exit non-zero under that score, handy for User Scripts).
 
 `--net=host` is only used so the scanner sees the host's listening ports; everything else is read-only.
 
