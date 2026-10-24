@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Investigatarr</Name>
+  <Repository>ghcr.io/p1zzm1ssile/investigatarr:latest</Repository>
+  <Network>host</Network>
+  <Support>https://github.com/p1zzm1ssile/Investigatarr/issues</Support>
+  <Project>https://github.com/p1zzm1ssile/Investigatarr</Project>
+  <Privileged>false</Privileged>
+  <Overview>Read-only security audit of your Unraid server. Checks management access, users, shares, Docker containers, VMs and listening services, then gives a score out of 100 with a fix for every finding.</Overview>
+  <Category>Security: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8088]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/p1zzm1ssile/Investigatarr/main/icon.png</Icon>
+  <Config Name="Host root (read-only)" Target="/host" Default="/" Mode="ro,rslave" Description="Host filesystem, mounted read-only so the scanner can read config. Do not make this writable." Type="Path" Display="advanced" Required="true">/</Config>
+  <Config Name="Reports" Target="/output" Default="/mnt/user/appdata/investigatarr" Mode="rw" Description="Where report.json and index.html are written." Type="Path" Display="always" Required="true">/mnt/user/appdata/investigatarr</Config>
+  <Config Name="Scan interval (hours)" Target="SCAN_INTERVAL_HOURS" Default="24" Mode="" Description="Rescan every N hours. 0 runs once and exits." Type="Variable" Display="always" Required="false">24</Config>
+  <Config Name="Web UI port" Target="WEBUI_PORT" Default="8088" Mode="" Description="Port the report page is served on." Type="Variable" Display="always" Required="false">8088</Config>
+</Container>
