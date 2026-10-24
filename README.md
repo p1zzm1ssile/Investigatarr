@@ -34,7 +34,7 @@ Copy the template to your flash drive, then add it from **Docker > Add Container
 
 ```bash
 wget -O /boot/config/plugins/dockerMan/templates-user/my-Investigatarr.xml \
-  https://raw.githubusercontent.com/p1zzm1ssile/Investigatarr/main/templates/investigatarr.xml
+  https://raw.githubusercontent.com/p1zzm1ssile/unraid-templates/main/templates/investigatarr.xml
 ```
 
 Open the web UI from the container's icon (port 8088).
