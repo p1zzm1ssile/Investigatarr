@@ -9,7 +9,7 @@ A small container that audits an Unraid server and gives it a security score out
 | Area | Checks |
 |---|---|
 | OS | Unraid version still supported |
-| Users | Empty passwords, weak (MD5) root hash |
+| Users | Root with no password, weak (MD5) root hash, share users with no password (system accounts like `named` are ignored) |
 | Management access | Telnet, HTTP-only web UI, UPnP, SSH password logins, SSH on 22 + UPnP, FTP |
 | Shares | Public SMB shares (worse for appdata/system/domains/isos), "Secure" guest-read shares, public NFS, SMBv1/NetBIOS |
 | Docker | Privileged containers, risky capabilities, Docker socket mounts, writable host-system mounts, host networking, running as root, default passwords in env vars |
@@ -25,7 +25,7 @@ Start at 100. Each finding subtracts: critical 25, high 12, medium 6, low 2. Rep
 ## Output
 
 - `/output/index.html` — report page ([example](docs/sample-report.html)), also served on `WEBUI_PORT` (default 8088)
-- `/output/report.json` — machine-readable results
+- `/output/report.json`, `report.csv`, `report.md` — the findings in other formats. The report page has Export buttons for each, plus Print / PDF
 - Summary in the container log
 
 ## Install on Unraid

@@ -6,6 +6,7 @@ server's security posture. Needs no Docker socket: container settings are
 read straight from /var/lib/docker on the host.
 """
 import glob
+import csv
 import html
 import json
 import os
@@ -81,6 +82,8 @@ def check_version():
 
 
 def check_root_password():
+    # Only root logs in with a shadow password. Service accounts such as
+    # 'named' ship with an empty field but no usable login, so they are skipped.
     shadow = read(hp("etc/shadow"))
     if shadow is None:
         return
@@ -89,15 +92,22 @@ def check_root_password():
         if len(parts) < 2:
             continue
         user, pw = parts[0], parts[1]
-        if pw == "":
-            sev = "critical" if user == "root" else "high"
-            add("auth.empty_password", sev, "User '%s' has no password" % user,
-                "Anyone reaching SSH, SMB or the web UI can log in as this user.",
-                "Set a strong password under Users.")
+        if user == "root" and pw == "":
+            add("auth.empty_password", "critical", "Root has no password",
+                "Anyone reaching SSH or the web UI can log in as root.",
+                "Set a strong root password under Users.")
         elif user == "root" and pw.startswith("$1$"):
             add("auth.weak_hash", "medium", "Root password uses MD5 hashing",
                 "MD5-crypt hashes are fast to brute force if the flash drive leaks.",
                 "Change the root password so it is re-hashed with SHA-512.")
+    # Share users log in through Samba, so their password lives in smbpasswd.
+    # The account flags field contains 'N' when the user has no password.
+    for line in (read(os.path.join(BOOT, "config/smbpasswd")) or "").splitlines():
+        parts = line.split(":")
+        if len(parts) > 4 and "N" in parts[4].strip("[]"):
+            add("auth.empty_password", "high", "User '%s' has no share password" % parts[0],
+                "Anyone on the network can open this user's shares as them.",
+                "Set a password for %s under Users." % parts[0])
 
 
 def check_management_access():
@@ -346,6 +356,27 @@ def score():
     return s, grade
 
 
+def write_exports(report):
+    with open(os.path.join(OUT, "report.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["severity", "title", "detail", "fix", "check"])
+        for x in report["findings"]:
+            w.writerow([x["severity"], x["title"], x["detail"], x["fix"], x["id"]])
+    lines = ["# Investigatarr report", "",
+             "**Score:** %d/100 (grade %s)  " % (report["score"], report["grade"]),
+             "**Scanned:** %s  " % report["scanned_at"],
+             "**Unraid:** %s" % report["unraid_version"], ""]
+    for sev in SEV_ORDER:
+        items = [x for x in report["findings"] if x["severity"] == sev]
+        if items:
+            lines += ["## %s (%d)" % (sev.capitalize(), len(items)), ""]
+            for x in items:
+                lines += ["- **%s**. %s Fix: %s" % (x["title"], x["detail"], x["fix"])]
+            lines.append("")
+    with open(os.path.join(OUT, "report.md"), "w") as f:
+        f.write("\n".join(lines))
+
+
 def render_html(report):
     colors = {"critical": "#b91c1c", "high": "#c2410c", "medium": "#a16207",
               "low": "#1d4ed8", "info": "#4b5563"}
@@ -365,9 +396,13 @@ body{font-family:system-ui,sans-serif;max-width:900px;margin:24px auto;padding:0
 .score{font-size:64px;font-weight:700}.grade{font-size:28px;margin-left:12px}
 table{width:100%%;border-collapse:collapse;background:#fff}td{border-top:1px solid #e2e8f0;padding:10px;vertical-align:top}
 .sev{color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;text-transform:uppercase}
+.export{float:right;margin-top:28px;font-size:14px}.export a,.export button{margin-left:8px;padding:6px 10px;border:1px solid #94a3b8;border-radius:6px;background:transparent;color:inherit;text-decoration:none;font:inherit;cursor:pointer}
+@media print{.export{display:none}body{background:#fff;color:#000}}
 .d{color:#475569;margin-top:4px}.fix{color:#065f46;margin-top:4px}.meta{color:#64748b}
 @media(prefers-color-scheme:dark){body{background:#0f172a;color:#e2e8f0}table{background:#1e293b}td{border-color:#334155}.d{color:#94a3b8}.fix{color:#6ee7b7}}
 </style></head><body>
+<nav class="export">Export:
+<a href="report.csv" download>CSV</a><a href="report.md" download>Markdown</a><a href="report.json" download>JSON</a><button onclick="window.print()">Print / PDF</button></nav>
 <h1><img src="icon.png" alt="" width="56" height="56" style="vertical-align:middle;border-radius:8px;margin-right:10px">Investigatarr</h1>
 <div><span class="score">%d</span><span class="grade">/ 100 &nbsp; Grade %s</span></div>
 <p class="meta">%s · Unraid %s · %d containers · %d VMs · scanned %s</p>
@@ -407,6 +442,7 @@ def run_scan():
         shutil.copyfile(icon, os.path.join(OUT, "icon.png"))
     with open(os.path.join(OUT, "report.json"), "w") as f:
         json.dump(report, f, indent=2)
+    write_exports(report)
     with open(os.path.join(OUT, "index.html"), "w") as f:
         f.write(render_html(report))
     print("Investigatarr score: %d/100 (grade %s)" % (s, grade))
