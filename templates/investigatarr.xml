@@ -9,7 +9,7 @@
   <Support>https://github.com/p1zzm1ssile/Investigatarr/issues</Support>
   <TemplateURL>https://raw.githubusercontent.com/p1zzm1ssile/unraid-templates/main/templates/investigatarr.xml</TemplateURL>
   <Project>https://github.com/p1zzm1ssile/Investigatarr</Project>
-  <Overview>Checks your Unraid server's security and gives it a score out of 100, with a fix for every finding. Looks at management access (Telnet, HTTP, UPnP, SSH, FTP), passwords and password reuse, SMB and NFS shares, Docker containers, VMs and exposed services. Read-only: it mounts the host read-only and needs no Docker socket and no privileged mode. Free forever: no paid tiers, no Pro account, no subscriptions.</Overview>
+  <Overview>Checks your Unraid server's security and gives it a score out of 100, with a fix for every finding. Looks at management access (Telnet, HTTP, UPnP, SSH, FTP), passwords and password reuse, SMB and NFS shares, Docker containers, VMs and exposed services. Read-only by default: it mounts the host read-only and needs no Docker socket and no privileged mode. Optional cleanup lists old containers, unused appdata and empty shares and files, with Delete buttons and a 30-day recycle bin if you turn them on. Free forever: no paid tiers, no Pro account, no subscriptions.</Overview>
   <Category>Security: Tools:System</Category>
   <WebUI>http://[IP]:[PORT:8088]/</WebUI>
   <Icon>https://raw.githubusercontent.com/p1zzm1ssile/Investigatarr/main/icon.png</Icon>
@@ -18,4 +18,8 @@
   <Config Name="Reports" Target="/output" Default="/mnt/user/appdata/investigatarr" Mode="rw" Description="Where the report page and report.json are saved" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/investigatarr</Config>
   <Config Name="Scan interval (hours)" Target="SCAN_INTERVAL_HOURS" Default="24" Mode="" Description="Rescan every N hours. 0 runs once and stops." Type="Variable" Display="always" Required="false" Mask="false">24</Config>
   <Config Name="Web UI port" Target="WEBUI_PORT" Default="8088" Mode="" Description="Port for the report page (host networking, so pick a free port)" Type="Variable" Display="always" Required="false" Mask="false">8088</Config>
+  <Config Name="Allow delete" Target="ALLOW_DELETE" Default="no|yes" Mode="" Description="yes shows Delete buttons in the Cleanup list. Deleted files go to a recycle bin first. Also needs the two mappings below." Type="Variable" Display="always" Required="false" Mask="false">no</Config>
+  <Config Name="Recycle bin days" Target="RECYCLE_DAYS" Default="30" Mode="" Description="Days deleted files stay in the recycle bin before they are removed for good" Type="Variable" Display="always" Required="false" Mask="false">30</Config>
+  <Config Name="Shares (for delete)" Target="/rw/mnt/user" Default="" Mode="rw" Description="Only needed for deleting. Set to /mnt/user to let Investigatarr move clutter to its recycle bin. Leave empty to stay read-only." Type="Path" Display="advanced" Required="false" Mask="false"></Config>
+  <Config Name="Docker socket (for delete)" Target="/var/run/docker.sock" Default="" Mode="rw" Description="Only needed to remove old containers. Set to /var/run/docker.sock. Leave empty otherwise." Type="Path" Display="advanced" Required="false" Mask="false"></Config>
 </Container>

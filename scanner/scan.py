@@ -20,6 +20,10 @@ from datetime import datetime, timezone
 HOST = os.environ.get("HOST_ROOT", "/host")
 BOOT = os.environ.get("BOOT_ROOT", os.path.join(HOST, "boot"))
 OUT = os.environ.get("OUTPUT_DIR", "/output")
+RW_ROOT = os.environ.get("RW_ROOT", "/rw/mnt/user")
+DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
+RECYCLE_DIR = ".investigatarr-recycle"
+RECYCLE_DAYS = int(os.environ.get("RECYCLE_DAYS", "30") or 30)
 
 PENALTY = {"critical": 25, "high": 12, "medium": 6, "low": 2, "info": 0}
 SEV_ORDER = ["critical", "high", "medium", "low", "info"]
@@ -28,6 +32,7 @@ findings = []
 secrets = {}  # password value -> ["container:VAR", ...], filled by check_docker
 containers_seen = []  # {"name", "running", "finished", "binds"}, filled by check_docker
 cleanup = []  # clutter found by check_cleanup; listed in the report, never scored
+cleanup_paths = {}  # cleanup key -> host paths it covers (kept out of the report)
 lock = threading.RLock()
 last_scan = {}
 
@@ -506,9 +511,11 @@ def dir_size(path, limit=100000):
     return total
 
 
-def add_cleanup(kind, title, path, size, detail):
-    cleanup.append({"kind": kind, "key": "%s|%s" % (kind, tidy(path)), "title": title,
+def add_cleanup(kind, title, path, size, detail, paths=None):
+    key = "%s|%s" % (kind, tidy(path))
+    cleanup.append({"kind": kind, "key": key, "title": title,
                     "path": tidy(path), "size": size, "detail": detail})
+    cleanup_paths[key] = [tidy(x) for x in (paths or [path])]
 
 
 def check_cleanup():
@@ -525,7 +532,8 @@ def check_cleanup():
         if age >= days:
             add_cleanup("container", "Container '%s' stopped %d days ago" % (c["name"], age),
                         "docker:" + c["name"], 0,
-                        "Remove it from the Docker tab if you no longer use it.")
+                        "Remove it if you no longer use it. Its appdata is kept, and you can "
+                        "reinstall it from Apps > Previous Apps.")
 
     # appdata folders that no container (running or stopped) maps
     used = {c["name"].lower() for c in containers_seen}
@@ -539,7 +547,7 @@ def check_cleanup():
             continue  # pools are already merged into /mnt/user
         for e in sorted(os.listdir(appdata)):
             full = os.path.join(appdata, e)
-            if os.path.isdir(full) and e.lower() not in used:
+            if os.path.isdir(full) and e.lower() not in used and not e.startswith(RECYCLE_DIR):
                 add_cleanup("appdata", "appdata/%s is not used by any container" % e, full,
                             dir_size(full), "Left behind by a container that was removed.")
 
@@ -552,15 +560,16 @@ def check_cleanup():
         try:
             entries = os.listdir(root)
         except OSError:
-            entries = []
+            continue  # no folder: the share was already removed
         if not entries:
             add_cleanup("share", "Share '%s' is empty" % name, root, 0,
-                        "Delete it under Shares if you don't need it.")
+                        "Remove it if you don't need it. Its settings stay under Shares.")
             continue
         if name in ("appdata", "system", "domains", "isos"):
             continue  # apps and VMs keep empty placeholder files on purpose
         empty_files, empty_dirs = [], []
         for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d != RECYCLE_DIR]
             seen += len(dirnames) + len(filenames)
             if seen > max_entries:
                 break
@@ -572,12 +581,191 @@ def check_cleanup():
                         empty_files.append(os.path.join(dirpath, fn))
                 except OSError:
                     pass
-        for label, items in (("empty file", empty_files), ("empty folder", empty_dirs)):
+        for kind, label, items in (("empty-files", "empty file", empty_files),
+                                   ("empty-folders", "empty folder", empty_dirs)):
             if items:
                 label += "s" if len(items) > 1 else ""
                 sample = ", ".join(tidy(x) for x in items[:5])
-                add_cleanup("empty", "%d %s in share '%s'" % (len(items), label, name), root, 0,
-                            "For example: %s%s" % (sample, " …" if len(items) > 5 else ""))
+                add_cleanup(kind, "%d %s in share '%s'" % (len(items), label, name), root, 0,
+                            "For example: %s%s" % (sample, " …" if len(items) > 5 else ""),
+                            paths=items[:5000])
+
+
+# ---------------------------------------------------------------- delete + recycle bin
+#
+# Deleting is off unless ALLOW_DELETE=yes and /mnt/user is mounted read-write at
+# RW_ROOT. Nothing is removed straight away: files move into a hidden
+# .investigatarr-recycle folder inside the same share (a cheap rename) and are
+# purged after RECYCLE_DAYS. Containers are removed through the Docker socket;
+# their appdata and template stay, so they can be reinstalled.
+
+def delete_enabled():
+    return os.environ.get("ALLOW_DELETE", "no").lower() in ("yes", "true", "1") and os.path.isdir(RW_ROOT)
+
+
+def rw_path(user_path):
+    """Map /mnt/user/... to the writable mount, refusing anything outside it."""
+    if not user_path.startswith("/mnt/user/"):
+        raise ValueError("not under /mnt/user: %s" % user_path)
+    real = os.path.realpath(os.path.join(RW_ROOT, user_path[len("/mnt/user/"):]))
+    if not real.startswith(os.path.realpath(RW_ROOT) + os.sep):
+        raise ValueError("outside the share mount: %s" % user_path)
+    return real
+
+
+def load_bin():
+    try:
+        with open(os.path.join(OUT, "recycle.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def save_bin(entries):
+    with open(os.path.join(OUT, "recycle.json"), "w") as f:
+        json.dump(entries, f, indent=2)
+
+
+def log_action(text):
+    with open(os.path.join(OUT, "deleted.log"), "a") as f:
+        f.write("%s %s\n" % (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), text))
+
+
+def docker_api(method, path):
+    import http.client
+    import socket
+
+    class Conn(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(30)
+            self.sock.connect(DOCKER_SOCK)
+
+    conn = Conn("localhost")
+    conn.request(method, path)
+    r = conn.getresponse()
+    body = r.read().decode("utf-8", "replace")
+    if r.status >= 300:
+        raise RuntimeError("Docker said %d: %s" % (r.status, body[:200]))
+    return body
+
+
+def to_bin(user_path, stamp):
+    """Move one path into its share's recycle folder and return where it went."""
+    src = rw_path(user_path)
+    share, _, rel = user_path[len("/mnt/user/"):].partition("/")
+    if not rel:
+        raise ValueError("refusing to move a whole share")
+    dst = os.path.join(RW_ROOT, share, RECYCLE_DIR, stamp, rel)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    os.rename(src, dst)
+    return "/mnt/user/%s/%s/%s/%s" % (share, RECYCLE_DIR, stamp, rel)
+
+
+def delete_item(key):
+    if not delete_enabled():
+        raise PermissionError("Deleting is turned off. Set ALLOW_DELETE=yes and map /mnt/user.")
+    item = next((c for c in last_scan.get("cleanup_items", []) if c["key"] == key), None)
+    if not item:
+        raise LookupError("That item is no longer in the cleanup list. Rescan and try again.")
+    paths = cleanup_paths.get(key, [])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    entry = {"id": "%s-%d" % (stamp, len(load_bin())), "kind": item["kind"], "title": item["title"],
+             "deleted_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+             "size": item["size"], "moved": []}
+    if item["kind"] == "container":
+        name = item["path"].split(":", 1)[1]
+        info = json.loads(docker_api("GET", "/containers/%s/json" % name))
+        if info.get("State", {}).get("Running"):
+            raise RuntimeError("'%s' is running now, so it was left alone." % name)
+        docker_api("DELETE", "/containers/%s" % name)
+        entry["note"] = "Reinstall from Apps > Previous Apps to restore."
+        log_action("removed container %s" % name)
+        save_bin(load_bin() + [entry])  # kept for the record; restore is via Previous Apps
+        return
+    if item["kind"] == "share":
+        os.rmdir(rw_path(item["path"] + "/"))  # only succeeds while still empty
+        entry["moved"].append([item["path"], None])
+    elif item["kind"] == "appdata":
+        # re-check nothing started using it since the scan
+        name = os.path.basename(item["path"]).lower()
+        users = [c for c in containers_seen if any(
+            re.match(r"/mnt/[^/]+/appdata/%s(/|$)" % re.escape(name), b, re.I) for b in c["binds"])]
+        if users:
+            raise RuntimeError("A container uses this folder now, so it was left alone.")
+        entry["moved"].append([item["path"], to_bin(item["path"], stamp)])
+    elif item["kind"] == "empty-files":
+        for p in paths:
+            try:
+                if os.lstat(rw_path(p)).st_size == 0:
+                    entry["moved"].append([p, to_bin(p, stamp)])
+            except OSError:
+                pass
+    elif item["kind"] == "empty-folders":
+        for p in sorted(paths, key=len, reverse=True):
+            try:
+                os.rmdir(rw_path(p))
+                entry["moved"].append([p, None])
+            except OSError:
+                pass  # no longer empty, or already gone
+    log_action("deleted %s (%d paths)" % (item["title"], len(entry["moved"])))
+    save_bin(load_bin() + [entry])
+
+
+def restore_item(entry_id):
+    entries = load_bin()
+    entry = next((e for e in entries if e["id"] == entry_id), None)
+    if not entry:
+        raise LookupError("Not in the recycle bin.")
+    if entry["kind"] == "container":
+        raise RuntimeError("Reinstall containers from Apps > Previous Apps.")
+    for original, binned in entry["moved"]:
+        dst = rw_path(original)
+        if os.path.exists(dst):
+            continue
+        if binned is None:
+            os.makedirs(dst, exist_ok=True)  # empty folder or share: recreate it
+        else:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.rename(rw_path(binned), dst)
+    log_action("restored %s" % entry["title"])
+    save_bin([e for e in entries if e["id"] != entry_id])
+
+
+def purge_bin(entry_id=None):
+    """Remove bin entries older than RECYCLE_DAYS, or one entry now."""
+    if not os.path.isdir(RW_ROOT) or not load_bin():
+        return
+    keep, now = [], datetime.now(timezone.utc)
+    for e in load_bin():
+        when = datetime.strptime(e["deleted_at"], "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+        if e["id"] != entry_id and (entry_id or (now - when).days < RECYCLE_DAYS):
+            keep.append(e)
+            continue
+        for _, binned in e.get("moved", []):
+            if binned:
+                try:
+                    target = rw_path(binned)
+                    if os.path.isdir(target) and not os.path.islink(target):
+                        shutil.rmtree(target)
+                    else:
+                        os.remove(target)
+                except (OSError, ValueError):
+                    pass
+        log_action("emptied %s from the recycle bin" % e["title"])
+    save_bin(keep)
+    # drop the empty timestamp folders left behind
+    for stamp_dir in glob.glob(os.path.join(RW_ROOT, "*", RECYCLE_DIR, "*")):
+        for dirpath, _, _ in sorted(os.walk(stamp_dir), key=lambda w: -len(w[0])):
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+    for bin_dir in glob.glob(os.path.join(RW_ROOT, "*", RECYCLE_DIR)):
+        try:
+            os.rmdir(bin_dir)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- scoring + report
@@ -664,16 +852,42 @@ def render_html(report):
     if report["dismissed"]:
         dismissed = ("<h2>Dismissed (%d)</h2><p class='meta'>Not counted in your score.</p><table>%s</table>"
                      % (len(report["dismissed"]), "".join(row(f, True) for f in report["dismissed"])))
+    can_delete = report.get("delete_enabled")
+
+    def del_btn(c):
+        if not can_delete:
+            return ""
+        return ("<button class='del' data-key='%s' data-title='%s'>Delete</button>"
+                % (html.escape(c["key"], quote=True), html.escape(c["title"], quote=True)))
+
     clean = ""
     if report["cleanup"]:
         total = sum(c["size"] for c in report["cleanup"])
         clean = ("<h2>Cleanup (%d)</h2><p class='meta'>Clutter found on the server%s. Not counted in your score.</p><table>%s</table>"
                  % (len(report["cleanup"]), ", %s reclaimable" % human_size(total) if total else "",
                     "".join("<tr><td><span class='sev' style='background:#475569'>%s</span></td>"
-                            "<td><b>%s</b><div class='d'>%s</div><div class='d'><code>%s</code></div></td><td>%s</td></tr>"
-                            % (c["kind"], html.escape(c["title"]), html.escape(c["detail"]),
-                               html.escape(c["path"]), human_size(c["size"]) if c["size"] else "")
+                            "<td><b>%s</b><div class='d'>%s</div><div class='d'><code>%s</code></div></td><td>%s%s</td></tr>"
+                            % (c["kind"].split("-")[0], html.escape(c["title"]), html.escape(c["detail"]),
+                               html.escape(c["path"]), human_size(c["size"]) if c["size"] else "", del_btn(c))
                             for c in report["cleanup"])))
+        if not can_delete:
+            clean += ("<p class='meta'>To delete from here, set <code>ALLOW_DELETE</code> to <code>yes</code> "
+                      "and map <code>/mnt/user</code> in the container settings.</p>")
+    recycle = ""
+    if report.get("recycle"):
+        rrows = []
+        for e in report["recycle"]:
+            left = "removed" if e["kind"] == "container" else "%d days left" % e["days_left"]
+            btns = "" if e["kind"] == "container" else (
+                "<button class='bin' data-op='restore' data-id='%s'>Restore</button>"
+                "<button class='bin' data-op='purge' data-id='%s'>Delete now</button>"
+                % (html.escape(e["id"], quote=True), html.escape(e["id"], quote=True)))
+            rrows.append("<tr><td><span class='sev' style='background:#475569'>%s</span></td>"
+                         "<td><b>%s</b><div class='d'>Deleted %s · %s%s</div></td><td>%s</td></tr>"
+                         % (e["kind"].split("-")[0], html.escape(e["title"]), e["deleted_at"], left,
+                            " · " + html.escape(e["note"]) if e.get("note") else "", btns))
+        recycle = ("<h2>Recycle bin (%d)</h2><p class='meta'>Emptied automatically after %d days.</p><table>%s</table>"
+                   % (len(report["recycle"]), RECYCLE_DAYS, "".join(rrows)))
     counts = " · ".join("%s %d" % (k, report["counts"][k]) for k in SEV_ORDER if report["counts"][k])
     return """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -694,22 +908,40 @@ td:last-child{text-align:right;white-space:nowrap}h2{margin-top:32px}
 <h1><img src="icon.png" alt="" width="56" height="56" style="vertical-align:middle;border-radius:8px;margin-right:10px">Investigatarr</h1>
 <div><span class="score">%d</span><span class="grade">/ 100 &nbsp; Grade %s</span></div>
 <p class="meta">%s · Unraid %s · %d containers · %d VMs · scanned %s</p>
-<table>%s</table>%s%s
+<table>%s</table>%s%s%s
 <script>
 async function post(url, body) {
   try {
     const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
-    if (!r.ok) throw new Error(r.status);
+    if (!r.ok) throw new Error((await r.text()) || r.status);
     location.reload();
-  } catch (e) { alert("Couldn't reach Investigatarr (" + e.message + ")."); }
+  } catch (e) { alert(e.message); location.reload(); }
 }
 document.querySelectorAll("button.act").forEach(b => b.onclick = () =>
   post("api/dismiss", {key: b.dataset.key, dismiss: b.dataset.on === "1"}));
+document.querySelectorAll("button.del").forEach(b => b.onclick = () => {
+  if (confirm("Delete " + b.dataset.title + "?\\n\\nFiles go to the recycle bin for %d days. Containers are removed but can be reinstalled from Previous Apps."))
+    { b.textContent = "Deleting…"; post("api/delete", {key: b.dataset.key}); }
+});
+document.querySelectorAll("button.bin").forEach(b => b.onclick = () => {
+  if (b.dataset.op === "purge" && !confirm("Delete this for good? It can't be restored afterwards.")) return;
+  post("api/" + b.dataset.op, {id: b.dataset.id});
+});
 document.getElementById("rescan").onclick = e => { e.target.textContent = "Scanning…"; post("api/rescan"); };
 </script></body></html>""" % (
         report["score"], report["grade"], counts or "no issues found",
         html.escape(str(report["unraid_version"])), report["containers"], report["vms"],
-        report["scanned_at"], rows, dismissed, clean)
+        report["scanned_at"], rows, dismissed, clean, recycle, RECYCLE_DAYS)
+
+
+def recycle_view():
+    now, out = datetime.now(timezone.utc), []
+    for e in reversed(load_bin()):
+        when = datetime.strptime(e["deleted_at"], "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+        view = dict((k, v) for k, v in e.items() if k != "moved")
+        view["days_left"] = max(0, RECYCLE_DAYS - (now - when).days)
+        out.append(view)
+    return out
 
 
 def publish(found, cleanup_items, meta):
@@ -721,7 +953,8 @@ def publish(found, cleanup_items, meta):
         s, grade = score(active)
         report = dict(meta, score=s, grade=grade,
                       counts={k: sum(1 for f in active if f["severity"] == k) for k in SEV_ORDER},
-                      findings=active, dismissed=hidden, cleanup=cleanup_items)
+                      findings=active, dismissed=hidden, cleanup=cleanup_items,
+                      delete_enabled=delete_enabled(), recycle=recycle_view())
         os.makedirs(OUT, exist_ok=True)
         icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
         if os.path.exists(icon):
@@ -738,10 +971,13 @@ def run_scan():
     with lock:
         findings.clear()
         cleanup.clear()
+        cleanup_paths.clear()
         secrets.clear()
         containers_seen.clear()
         if not os.path.isdir(os.path.join(BOOT, "config")):
             sys.exit("Cannot see %s/config. Mount the host root read-only: -v /:/host:ro,rslave" % BOOT)
+        os.makedirs(OUT, exist_ok=True)
+        purge_bin()
         version = check_version()
         check_root_password()
         check_management_access()
@@ -782,14 +1018,36 @@ def serve(port):
             # Requiring JSON stops other websites from posting here behind your back
             if not (self.headers.get("Content-Type") or "").startswith("application/json"):
                 return self.send_error(415)
+            origin = self.headers.get("Origin")
+            if origin and origin.split("://", 1)[-1] != self.headers.get("Host"):
+                return self.send_error(403)
             try:
                 n = int(self.headers.get("Content-Length") or 0)
                 body = json.loads(self.rfile.read(min(n, 65536)) or b"{}")
             except ValueError:
                 return self.send_error(400)
-            if self.path.rstrip("/").endswith("/api/dismiss") and isinstance(body.get("key"), str):
+            path = self.path.rstrip("/")
+            actions = {"/api/delete": lambda: delete_item(str(body.get("key"))),
+                       "/api/restore": lambda: restore_item(str(body.get("id"))),
+                       "/api/purge": lambda: purge_bin(str(body.get("id")))}
+            if path.endswith("/api/dismiss") and isinstance(body.get("key"), str):
                 set_dismissed(body["key"][:500], bool(body.get("dismiss", True)))
-            elif self.path.rstrip("/").endswith("/api/rescan"):
+            elif path.endswith("/api/rescan"):
+                run_scan()
+            elif any(path.endswith(a) for a in actions):
+                fn = next(f for a, f in actions.items() if path.endswith(a))
+                try:
+                    with lock:
+                        fn()
+                except Exception as e:  # report the reason to the page
+                    msg = str(e).encode()
+                    self.send_response(409)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    self.wfile.write(msg)
+                    run_scan()
+                    return
                 run_scan()
             else:
                 return self.send_error(404)

@@ -2,7 +2,7 @@
 
 # Investigatarr
 
-A small container that audits an Unraid server and gives it a security score out of 100 (grade A–F), with a fix for every finding. It is **read-only**: it mounts the host filesystem `:ro` and needs no Docker socket and no privileged mode.
+A small container that audits an Unraid server and gives it a security score out of 100 (grade A–F), with a fix for every finding. It is **read-only** unless you turn on deleting: it mounts the host filesystem `:ro` and needs no Docker socket and no privileged mode.
 
 ## What it checks
 
@@ -36,7 +36,19 @@ The report also lists clutter, without scoring it:
 - empty shares
 - empty files and folders inside shares (appdata, system, domains and isos are skipped; the walk stops after `CLEANUP_MAX_FILES` entries, default 500000)
 
-Investigatarr only lists these. It never deletes anything.
+By default Investigatarr only lists these.
+
+### Deleting (optional)
+
+To get **Delete** buttons, edit the container and:
+
+1. set **Allow delete** (`ALLOW_DELETE`) to `yes`
+2. set **Shares (for delete)** to `/mnt/user` (mapped to `/rw/mnt/user` in the container)
+3. to remove old containers too, set **Docker socket (for delete)** to `/var/run/docker.sock`
+
+Every delete asks you to confirm first. Files and folders go to a hidden `.investigatarr-recycle` folder in the same share, and a **Recycle bin** section on the report lets you **Restore** them or **Delete now**. Anything left in the bin is removed for good after `RECYCLE_DAYS` (default 30). Removed containers keep their appdata and can be reinstalled from **Apps > Previous Apps**. Empty folders and shares are removed and recreated on restore. Every action is logged to `/output/deleted.log`.
+
+Deleting only works on items in the current cleanup list, only inside `/mnt/user`, and never on a running container or an appdata folder a container still maps.
 
 ## Output
 
