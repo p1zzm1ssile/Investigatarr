@@ -7,6 +7,8 @@ read straight from /var/lib/docker on the host.
 """
 import glob
 import csv
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -256,6 +258,128 @@ def check_docker():
     return count
 
 
+_B64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _b64(data, groups, tail):
+    out = []
+    for a, b, c in groups:
+        v = (data[a] << 16) | (data[b] << 8) | data[c]
+        out.extend(_B64[(v >> s) & 63] for s in (0, 6, 12, 18))
+    v = 0
+    for i in tail:
+        v = (v << 8) | data[i]
+    n = (len(tail) * 8 + 5) // 6
+    out.extend(_B64[(v >> (6 * k)) & 63] for k in range(n))
+    return "".join(out)
+
+
+def _md5_crypt(pw, salt):
+    salt = salt[:8]
+    alt = hashlib.md5(pw + salt + pw).digest()
+    ctx = hashlib.md5(pw + b"$1$" + salt)
+    for i in range(len(pw), 0, -16):
+        ctx.update(alt[:min(16, i)])
+    i = len(pw)
+    while i:
+        ctx.update(b"\0" if i & 1 else pw[:1])
+        i >>= 1
+    fin = ctx.digest()
+    for i in range(1000):
+        c = hashlib.md5()
+        c.update(pw if i & 1 else fin)
+        if i % 3:
+            c.update(salt)
+        if i % 7:
+            c.update(pw)
+        c.update(fin if i & 1 else pw)
+        fin = c.digest()
+    groups = [(0, 6, 12), (1, 7, 13), (2, 8, 14), (3, 9, 15), (4, 10, 5)]
+    return "$1$%s$%s" % (salt.decode(), _b64(fin, groups, [11]))
+
+
+def _sha_crypt(pw, salt, rounds, prefix):
+    """SHA-256/512 crypt as specified by Ulrich Drepper (glibc and musl)."""
+    h = hashlib.sha512 if prefix == "6" else hashlib.sha256
+    size = h().digest_size
+    salt = salt[:16]
+    b = h(pw + salt + pw).digest()
+    a = h(pw + salt)
+    for i in range(len(pw), 0, -size):
+        a.update(b[:min(size, i)])
+    i = len(pw)
+    while i:
+        a.update(b if i & 1 else pw)
+        i >>= 1
+    a = a.digest()
+    dp = h(pw * len(pw)).digest()
+    p = (dp * (len(pw) // size + 1))[:len(pw)]
+    ds = h(salt * (16 + a[0])).digest()
+    s = (ds * (len(salt) // size + 1))[:len(salt)]
+    c = a
+    for i in range(rounds):
+        x = h(p if i & 1 else c)
+        if i % 3:
+            x.update(s)
+        if i % 7:
+            x.update(p)
+        x.update(c if i & 1 else p)
+        c = x.digest()
+    if prefix == "6":
+        groups = []
+        a_, b_, c_ = 0, 21, 42
+        for _ in range(21):
+            groups.append((a_, b_, c_))
+            a_, b_, c_ = (b_ + 1) % 63, (c_ + 1) % 63, (a_ + 1) % 63
+        tail = [63]
+    else:
+        groups = []
+        a_, b_, c_ = 0, 10, 20
+        for _ in range(10):
+            groups.append((a_, b_, c_))
+            a_, b_, c_ = (c_ + 1) % 30, (a_ + 1) % 30, (b_ + 1) % 30
+        tail = [31, 30]
+    return _b64(c, groups, tail)
+
+
+def _libc_crypt(pw, setting):
+    """Fall back to the C library for schemes not done in Python (e.g. yescrypt)."""
+    import ctypes
+    import ctypes.util
+    for name in (ctypes.util.find_library("crypt"), "libcrypt.so.1", "libcrypt.so.2", None):
+        try:
+            fn = ctypes.CDLL(name).crypt
+        except (OSError, AttributeError):
+            continue
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        fn.restype = ctypes.c_char_p
+        out = fn(pw, setting.encode())
+        return out.decode() if out else None
+    return None
+
+
+def crypt_matches(password, hashed):
+    """True when password produces the crypt(3) hash 'hashed'.
+
+    The stdlib crypt module is gone from Python 3.13, so the common Unix
+    schemes ($1$, $5$, $6$) are computed here and anything else is handed
+    to the C library when one is available.
+    """
+    pw = password.encode()
+    m = re.match(r"^\$([156])\$(?:rounds=(\d+)\$)?([^$]*)\$", hashed)
+    try:
+        if m and m.group(1) == "1":
+            out = _md5_crypt(pw, m.group(3).encode())
+        elif m:
+            rounds = min(max(int(m.group(2) or 5000), 1000), 999999999)
+            out = hashed[:m.end()] + _sha_crypt(pw, m.group(3).encode(), rounds, m.group(1))
+        else:
+            out = _libc_crypt(pw, hashed)
+    except Exception:
+        return False
+    return bool(out) and hmac.compare_digest(out, hashed)
+
+
 def check_password_reuse():
     """Spot one password used in several places.
 
@@ -275,20 +399,12 @@ def check_password_reuse():
         if parts[0] == "root" and len(parts) > 1 and parts[1].startswith("$"):
             root_hash = parts[1]
     if root_hash and secrets:
-        try:
-            import crypt  # stdlib up to Python 3.12
-        except ImportError:
-            try:
-                import crypt_r as crypt
-            except ImportError:
-                crypt = None
-        if crypt:
-            for value, where in secrets.items():
-                if crypt.crypt(value, root_hash) == root_hash:
-                    add("pw.reuse.root", "critical", "Root password is reused in a container",
-                        "Found in %s. Anyone who can read that container's settings or "
-                        "appdata has your root password." % ", ".join(where),
-                        "Change the root password, and keep it unique.")
+        for value, where in secrets.items():
+            if crypt_matches(value, root_hash):
+                add("pw.reuse.root", "critical", "Root password is reused in a container",
+                    "Found in %s. Anyone who can read that container's settings or "
+                    "appdata has your root password." % ", ".join(where),
+                    "Change the root password, and keep it unique.")
     by_hash = {}
     for line in (read(os.path.join(BOOT, "config/smbpasswd")) or "").splitlines():
         parts = line.split(":")

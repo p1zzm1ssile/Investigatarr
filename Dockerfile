@@ -1,4 +1,4 @@
-FROM python:3.12-alpine
+FROM python:3.13-alpine
 LABEL org.opencontainers.image.source="https://github.com/p1zzm1ssile/Investigatarr" \
       org.opencontainers.image.title="Investigatarr" \
       org.opencontainers.image.description="Read-only security audit and score for Unraid servers"
