@@ -17,6 +17,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timezone
 
 HOST = os.environ.get("HOST_ROOT", "/host")
@@ -1083,6 +1084,17 @@ def publish(found, cleanup_items, meta):
         return report
 
 
+def step(check, default=None):
+    """Run one check. A failing check is logged and skipped so the rest still run."""
+    print("Running %s" % check.__name__)
+    try:
+        return check()
+    except Exception:
+        traceback.print_exc()
+        print("%s failed; continuing with the other checks" % check.__name__)
+        return default
+
+
 def run_scan():
     with lock:
         findings.clear()
@@ -1093,19 +1105,19 @@ def run_scan():
         if not os.path.isdir(os.path.join(BOOT, "config")):
             sys.exit("Cannot see %s/config. Mount the host root read-only: -v /:/host:ro,rslave" % BOOT)
         os.makedirs(OUT, exist_ok=True)
-        purge_bin()
-        version = check_version()
-        check_root_password()
-        check_management_access()
-        check_shares()
-        containers = check_docker()
-        check_password_reuse()
-        check_upnp_apps()
-        ports = check_listening()
-        check_router_upnp()
-        plugins = check_plugins()
-        vms = check_vms()
-        check_cleanup()
+        step(purge_bin)
+        version = step(check_version)
+        step(check_root_password)
+        step(check_management_access)
+        step(check_shares)
+        containers = step(check_docker, 0)
+        step(check_password_reuse)
+        step(check_upnp_apps)
+        ports = step(check_listening, [])
+        step(check_router_upnp)
+        plugins = step(check_plugins, [])
+        vms = step(check_vms, [])
+        step(check_cleanup)
         findings.sort(key=lambda f: SEV_ORDER.index(f["severity"]))
         meta = {"scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                 "unraid_version": version, "containers": containers, "vms": vms,
@@ -1178,9 +1190,18 @@ def serve(port):
 
 def main():
     interval = int(os.environ.get("SCAN_INTERVAL_HOURS", "0") or 0)
-    report = run_scan()
     if interval > 0 and os.environ.get("WEBUI_PORT"):
+        # Start the page before the first scan, which can take a while on big shares
+        os.makedirs(OUT, exist_ok=True)
+        index = os.path.join(OUT, "index.html")
+        if not os.path.exists(index):
+            with open(index, "w") as f:
+                f.write("<!doctype html><meta charset='utf-8'><meta http-equiv='refresh' content='10'>"
+                        "<title>Investigatarr</title><body style='font-family:sans-serif;padding:2em'>"
+                        "<h1>Investigatarr</h1><p>The first scan is running. This page refreshes "
+                        "every 10 seconds and shows the report when it is ready.</p>")
         serve(int(os.environ["WEBUI_PORT"]))
+    report = run_scan()
     if interval <= 0:
         fail_below = int(os.environ.get("FAIL_BELOW", "0") or 0)
         sys.exit(1 if report["score"] < fail_below else 0)
