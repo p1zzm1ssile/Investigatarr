@@ -910,17 +910,41 @@ def load_dismissed():
         return {}
 
 
+def key_title(key):
+    return key.split("|", 1)[-1]
+
+
 def set_dismissed(key, dismiss):
     with lock:
         d = load_dismissed()
+        if dismiss == (key in d):
+            return  # already done, e.g. a double click
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         if dismiss:
-            d[key] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            d[key] = now
         else:
             d.pop(key, None)
         with open(os.path.join(OUT, "dismissed.json"), "w") as f:
             json.dump(d, f, indent=2)
+        with open(os.path.join(OUT, "dismissed.log"), "a") as f:
+            f.write("%s\t%s\t%s\n" % (now, "dismissed" if dismiss else "restored", key_title(key)))
         if last_scan:
             publish(**last_scan)
+
+
+def dismiss_history(limit=20):
+    """Newest dismiss/restore events from dismissed.log."""
+    try:
+        with open(os.path.join(OUT, "dismissed.log"), encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            out.append({"at": parts[0], "action": parts[1], "title": parts[2]})
+    return out
 
 
 def human_size(n):
@@ -956,19 +980,40 @@ def render_html(report):
               "low": "#1d4ed8", "info": "#4b5563"}
 
     def row(f, dismissed=False):
-        btn = ("<button class='act' data-key='%s' data-on='%d'>%s</button>"
-               % (html.escape(f["key"], quote=True), 0 if dismissed else 1,
-                  "Restore" if dismissed else "Dismiss"))
+        btn = ("<button class='act' data-key='%s' data-title='%s' data-on='%d'>%s</button>"
+               % (html.escape(f["key"], quote=True), html.escape(f["title"], quote=True),
+                  0 if dismissed else 1, "Restore" if dismissed else "Dismiss"))
+        when = ("<div class='meta'>Dismissed %s</div>" % html.escape(f["dismissed_at"])
+                if dismissed and f.get("dismissed_at") else "")
         return ("<tr%s><td><span class='sev' style='background:%s'>%s</span></td>"
-                "<td><b>%s</b><div class='d'>%s</div><div class='fix'>Fix: %s</div></td><td>%s</td></tr>"
+                "<td><b>%s</b><div class='d'>%s</div><div class='fix'>Fix: %s</div>%s</td><td>%s</td></tr>"
                 % (" class='dim'" if dismissed else "", colors[f["severity"]], f["severity"],
-                   html.escape(f["title"]), html.escape(f["detail"]), html.escape(f["fix"]), btn))
+                   html.escape(f["title"]), html.escape(f["detail"]), html.escape(f["fix"]), when, btn))
 
     rows = "".join(row(f) for f in report["findings"]) or "<tr><td>No issues found.</td></tr>"
-    dismissed = ""
-    if report["dismissed"]:
-        dismissed = ("<h2>Dismissed (%d)</h2><p class='meta'>Not counted in your score.</p><table>%s</table>"
-                     % (len(report["dismissed"]), "".join(row(f, True) for f in report["dismissed"])))
+    n_dismissed = len(report["dismissed"]) + len(report.get("dismissed_stale", []))
+    dismissed, jump = "", ""
+    if n_dismissed:
+        jump = ("<p class='meta'>%d dismissed finding%s not counted. <a href='#dismissed'>Show dismissed</a></p>"
+                % (n_dismissed, "" if n_dismissed == 1 else "s"))
+        stale = "".join(
+            "<tr class='dim'><td><span class='sev' style='background:#4b5563'>gone</span></td>"
+            "<td><b>%s</b><div class='d'>Not found in the latest scan. If it comes back it stays dismissed "
+            "until you restore it.</div><div class='meta'>Dismissed %s</div></td>"
+            "<td><button class='act' data-key='%s' data-title='%s' data-on='0'>Restore</button></td></tr>"
+            % (html.escape(key_title(k)), html.escape(at), html.escape(k, quote=True),
+               html.escape(key_title(k), quote=True))
+            for k, at in report.get("dismissed_stale", []))
+        dismissed = ("<h2 id='dismissed'>Dismissed (%d)</h2><p class='meta'>Not counted in your score. "
+                     "Press Restore to count a finding again.</p><table>%s%s</table>"
+                     % (n_dismissed, "".join(row(f, True) for f in report["dismissed"]), stale))
+    history = report.get("dismiss_history") or []
+    if history:
+        dismissed += ("<details class='hist'><summary>Dismiss history</summary><table>%s</table>"
+                      "<p class='meta'>Full log: <code>/output/dismissed.log</code></p></details>"
+                      % "".join("<tr><td class='meta'>%s</td><td>%s <b>%s</b></td></tr>"
+                                % (html.escape(h["at"]), html.escape(h["action"].capitalize()),
+                                   html.escape(h["title"])) for h in history))
     can_delete = report.get("delete_enabled")
 
     def del_btn(c):
@@ -1016,7 +1061,10 @@ td:last-child{text-align:right;white-space:nowrap}h2{margin-top:32px}
 .sev{color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;text-transform:uppercase}
 .export{float:right;margin-top:28px;font-size:14px}button,.export a{margin-left:8px;padding:6px 10px;border:1px solid #94a3b8;border-radius:6px;background:transparent;color:inherit;text-decoration:none;font:inherit;font-size:14px;cursor:pointer}
 .dim{opacity:.6}code{font-size:12px;word-break:break-all}
-@media print{.export,.act{display:none}body{background:#fff;color:#000}}
+.hist{margin-top:16px}.hist summary{cursor:pointer;color:#64748b}.hist td,.hist td:last-child{text-align:left;white-space:normal}.hist td:first-child{white-space:nowrap}
+#toast{position:fixed;left:50%%;bottom:24px;transform:translateX(-50%%);max-width:calc(100%% - 32px);background:#0f172a;color:#f8fafc;padding:10px 14px;border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.3);display:flex;align-items:center;gap:8px}
+#toast button{color:#f8fafc;border-color:#64748b;margin-left:0}
+@media print{.export,.act,#toast,.hist{display:none}body{background:#fff;color:#000}}
 .d{color:#475569;margin-top:4px}.fix{color:#065f46;margin-top:4px}.meta{color:#64748b}
 @media(prefers-color-scheme:dark){body{background:#0f172a;color:#e2e8f0}table{background:#1e293b}td{border-color:#334155}.d{color:#94a3b8}.fix{color:#6ee7b7}}
 </style></head><body>
@@ -1024,18 +1072,48 @@ td:last-child{text-align:right;white-space:nowrap}h2{margin-top:32px}
 <a href="report.csv" download>CSV</a><a href="report.md" download>Markdown</a><a href="report.json" download>JSON</a><button onclick="window.print()">Print / PDF</button><button id="rescan">Rescan now</button></nav>
 <h1><img src="icon.png" alt="" width="56" height="56" style="vertical-align:middle;border-radius:8px;margin-right:10px">Investigatarr</h1>
 <div><span class="score">%d</span><span class="grade">/ 100 &nbsp; Grade %s</span></div>
-<p class="meta">%s · Unraid %s · %d containers · %d VMs · scanned %s</p>
+<p class="meta">%s · Unraid %s · %d containers · %d VMs · scanned %s</p>%s
 <table>%s</table>%s%s%s
 <script>
-async function post(url, body) {
+async function post(url, body, hash) {
   try {
     const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
     if (!r.ok) throw new Error((await r.text()) || r.status);
+    if (hash) location.hash = hash;
     location.reload();
   } catch (e) { alert(e.message); location.reload(); }
 }
-document.querySelectorAll("button.act").forEach(b => b.onclick = () =>
-  post("api/dismiss", {key: b.dataset.key, dismiss: b.dataset.on === "1"}));
+function dismiss(key, on) {
+  // the hash survives the reload, so the page can offer Undo afterwards
+  post("api/dismiss", {key: key, dismiss: on}, (on ? "dismissed=" : "restored=") + encodeURIComponent(key));
+}
+document.querySelectorAll("button.act").forEach(b => b.onclick = () => {
+  b.disabled = true;
+  dismiss(b.dataset.key, b.dataset.on === "1");
+});
+(() => {
+  const m = location.hash.match(/^#(dismissed|restored)=(.+)$/);
+  if (!m) return;
+  history.replaceState(null, "", location.pathname + location.search);
+  const key = decodeURIComponent(m[2]), on = m[1] === "dismissed";
+  const b = [...document.querySelectorAll("button.act")].find(x => x.dataset.key === key);
+  const title = b ? b.dataset.title : key.split("|").slice(1).join("|");
+  const t = document.createElement("div");
+  t.id = "toast";
+  t.setAttribute("role", "status");
+  const msg = document.createElement("span");
+  msg.textContent = (on ? "Dismissed: " : "Restored: ") + title;
+  const undo = document.createElement("button");
+  undo.textContent = "Undo";
+  undo.onclick = () => { undo.disabled = true; dismiss(key, !on); };
+  const close = document.createElement("button");
+  close.textContent = "\u2715";
+  close.setAttribute("aria-label", "Close");
+  close.onclick = () => t.remove();
+  t.append(msg, undo, close);
+  document.body.append(t);
+  setTimeout(() => t.remove(), 15000);
+})();
 document.querySelectorAll("button.del").forEach(b => b.onclick = () => {
   if (confirm("Delete " + b.dataset.title + "?\\n\\nFiles go to the recycle bin for %d days. Containers are removed but can be reinstalled from Previous Apps."))
     { b.textContent = "Deleting…"; post("api/delete", {key: b.dataset.key}); }
@@ -1048,7 +1126,7 @@ document.getElementById("rescan").onclick = e => { e.target.textContent = "Scann
 </script></body></html>""" % (
         report["score"], report["grade"], counts or "no issues found",
         html.escape(str(report["unraid_version"])), report["containers"], report["vms"],
-        report["scanned_at"], rows, dismissed, clean, recycle, RECYCLE_DAYS)
+        report["scanned_at"], jump, rows, dismissed, clean, recycle, RECYCLE_DAYS)
 
 
 def recycle_view():
@@ -1066,11 +1144,14 @@ def publish(found, cleanup_items, meta):
     with lock:
         dismissed = load_dismissed()
         active = [f for f in found if f["key"] not in dismissed]
-        hidden = [f for f in found if f["key"] in dismissed]
+        hidden = [dict(f, dismissed_at=dismissed[f["key"]]) for f in found if f["key"] in dismissed]
+        keys = set(f["key"] for f in found)
+        stale = sorted(([k, at] for k, at in dismissed.items() if k not in keys), key=lambda x: x[1], reverse=True)
         s, grade = score(active)
         report = dict(meta, score=s, grade=grade,
                       counts={k: sum(1 for f in active if f["severity"] == k) for k in SEV_ORDER},
-                      findings=active, dismissed=hidden, cleanup=cleanup_items,
+                      findings=active, dismissed=hidden, dismissed_stale=stale,
+                      dismiss_history=dismiss_history(), cleanup=cleanup_items,
                       delete_enabled=delete_enabled(), recycle=recycle_view())
         os.makedirs(OUT, exist_ok=True)
         icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
@@ -1141,6 +1222,11 @@ def serve(port):
     class Handler(http.server.SimpleHTTPRequestHandler):
         def log_message(self, *args):
             pass
+
+        def end_headers(self):
+            # the report is rewritten in place, often within the same second, so never serve a cached copy
+            self.send_header("Cache-Control", "no-store")
+            super().end_headers()
 
         def do_POST(self):
             # Requiring JSON stops other websites from posting here behind your back
