@@ -25,7 +25,14 @@ Start at 100. Each finding subtracts: critical 25, high 12, medium 6, low 2. Rep
 
 ## Dismissing findings
 
-Each finding has a **Dismiss** button. A dismissed finding moves to a *Dismissed* section, stops counting against your score and stays dismissed on later scans; **Restore** brings it back. Dismissals are saved in `/output/dismissed.json`.
+Each finding has a **Dismiss** button. A dismissed finding moves to a *Dismissed* section, stops counting against your score and stays dismissed on later scans; **Restore** brings it back.
+
+- After you dismiss or restore something, a bar at the bottom of the page offers **Undo** for 15 seconds.
+- The top of the report says how many findings are dismissed, with a link to the *Dismissed* section.
+- Each dismissed finding shows when it was dismissed. Dismissals for things the latest scan no longer finds are listed too, so you can still restore them.
+- *Dismiss history* under that section lists the latest dismissals and restores.
+
+Dismissals are saved in `/output/dismissed.json`, and every dismiss and restore is logged to `/output/dismissed.log`.
 
 ## Cleanup
 
