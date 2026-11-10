@@ -25,6 +25,11 @@ BOOT = os.environ.get("BOOT_ROOT", os.path.join(HOST, "boot"))
 OUT = os.environ.get("OUTPUT_DIR", "/output")
 RW_ROOT = os.environ.get("RW_ROOT", "/rw/mnt/user")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
+DOCKER_HOST = os.environ.get("DOCKER_HOST", "")  # tcp://127.0.0.1:2375 to go through a socket proxy
+WEBUI_TOKEN = os.environ.get("WEBUI_TOKEN", "")  # optional password for the report page
+WEBUI_BIND = os.environ.get("WEBUI_BIND", "") or "0.0.0.0"
+WEBUI_HOSTS = os.environ.get("WEBUI_HOSTS", "")  # extra host names the page may be opened by
+RESCAN_COOLDOWN = 30  # seconds between rescans started from the page
 RECYCLE_DIR = ".investigatarr-recycle"
 RECYCLE_DAYS = int(os.environ.get("RECYCLE_DAYS", "30") or 30)
 
@@ -41,8 +46,13 @@ last_scan = {}
 
 
 def add(check_id, severity, title, detail, fix):
-    # key identifies a finding across scans so it can be dismissed
-    findings.append({"id": check_id, "key": "%s|%s" % (check_id, title), "severity": severity,
+    # key identifies a finding across scans so it can be dismissed. Two findings
+    # with the same title (e.g. two qBittorrent installs) get the detail added,
+    # so dismissing one never hides the other.
+    key = "%s|%s" % (check_id, title)
+    if any(f["key"] == key for f in findings):
+        key = "%s|%s||%s" % (check_id, title, detail)
+    findings.append({"id": check_id, "key": key, "severity": severity,
                      "title": title, "detail": detail, "fix": fix})
 
 
@@ -229,7 +239,12 @@ def check_docker():
         for bind in hc.get("Binds") or []:
             src = bind.split(":")[0]
             ro = bind.endswith(":ro") or ":ro," in bind
-            if src in ("/var/run/docker.sock", "/run/docker.sock"):
+            image = (cfg.get("Config", {}).get("Image") or "").lower()
+            if src in ("/var/run/docker.sock", "/run/docker.sock") and "socket-proxy" in image:
+                add("docker.socket_proxy", "low", "Container '%s' is a Docker socket proxy%s" % (name, tag),
+                    "A socket proxy is the safer way to share Docker, but it still holds the socket.",
+                    "Allow only the API sections your apps need, and don't publish its port to the LAN.")
+            elif src in ("/var/run/docker.sock", "/run/docker.sock"):
                 add("docker.socket", "high", "Container '%s' has the Docker socket%s" % (name, tag),
                     "Docker socket access is equivalent to root on the host, even read-only.",
                     "Remove the mount, or put a socket proxy in front of it.")
@@ -381,6 +396,14 @@ def crypt_matches(password, hashed):
     return bool(out) and hmac.compare_digest(out, hashed)
 
 
+def shared_by_design(var):
+    """Env vars that hold a value which has to match another container's."""
+    var = var.upper()
+    if re.search(r"TOKEN|API_?KEY", var) and "PASS" not in var:
+        return True  # API keys are copied between apps on purpose (e.g. the *arr stack)
+    return bool(re.search(r"MYSQL|MARIADB|POSTGRES|PG_|DB_|DBPASS|DATABASE|REDIS|MONGO", var))
+
+
 def check_password_reuse():
     """Spot one password used in several places.
 
@@ -390,8 +413,12 @@ def check_password_reuse():
     """
     for value, where in secrets.items():
         apps = sorted({w.split(":")[0] for w in where})
-        if len(apps) > 1:
-            add("pw.reuse.containers", "medium", "Same password used by %d containers" % len(apps),
+        # An API key copied from Sonarr into Prowlarr, or a database password
+        # given to both the database and its app, is shared on purpose. Only
+        # flag a value when at least one container uses it as a login password.
+        if len(apps) > 1 and any(not shared_by_design(w.split(":", 1)[1]) for w in where):
+            names = ", ".join(apps[:4]) + (" and %d more" % (len(apps) - 4) if len(apps) > 4 else "")
+            add("pw.reuse.containers", "medium", "Same password used by %s" % names,
                 "Used in %s. One leaked app config exposes the others." % ", ".join(where),
                 "Give each container its own random password.")
     root_hash = None
@@ -758,7 +785,11 @@ def docker_api(method, path):
             self.sock.settimeout(30)
             self.sock.connect(DOCKER_SOCK)
 
-    conn = Conn("localhost")
+    if DOCKER_HOST.startswith("tcp://"):
+        # a socket proxy that only allows reading and removing containers
+        conn = http.client.HTTPConnection(DOCKER_HOST[len("tcp://"):].rstrip("/"), timeout=30)
+    else:
+        conn = Conn("localhost")
     conn.request(method, path)
     r = conn.getresponse()
     body = r.read().decode("utf-8", "replace")
@@ -911,7 +942,7 @@ def load_dismissed():
 
 
 def key_title(key):
-    return key.split("|", 1)[-1]
+    return key.split("|", 1)[-1].split("||")[0]
 
 
 def set_dismissed(key, dismiss):
@@ -1097,7 +1128,7 @@ document.querySelectorAll("button.act").forEach(b => b.onclick = () => {
   history.replaceState(null, "", location.pathname + location.search);
   const key = decodeURIComponent(m[2]), on = m[1] === "dismissed";
   const b = [...document.querySelectorAll("button.act")].find(x => x.dataset.key === key);
-  const title = b ? b.dataset.title : key.split("|").slice(1).join("|");
+  const title = b ? b.dataset.title : key.split("|").slice(1).join("|").split("||")[0];
   const t = document.createElement("div");
   t.id = "toast";
   t.setAttribute("role", "status");
@@ -1122,7 +1153,22 @@ document.querySelectorAll("button.bin").forEach(b => b.onclick = () => {
   if (b.dataset.op === "purge" && !confirm("Delete this for good? It can't be restored afterwards.")) return;
   post("api/" + b.dataset.op, {id: b.dataset.id});
 });
-document.getElementById("rescan").onclick = e => { e.target.textContent = "Scanning…"; post("api/rescan"); };
+document.getElementById("rescan").onclick = async e => {
+  // the scan runs in the background; wait for it to finish, then show the new report
+  const b = e.target;
+  b.disabled = true;
+  b.textContent = "Scanning…";
+  try {
+    const r = await fetch("api/rescan", {method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"});
+    if (!r.ok) throw new Error((await r.text()) || r.status);
+    for (;;) {
+      await new Promise(done => setTimeout(done, 2000));
+      const s = await (await fetch("api/status", {cache: "no-store"})).json();
+      if (!s.scanning) break;
+    }
+    location.reload();
+  } catch (err) { alert(err.message); b.disabled = false; b.textContent = "Rescan now"; }
+};
 </script></body></html>""" % (
         report["score"], report["grade"], counts or "no issues found",
         html.escape(str(report["unraid_version"])), report["containers"], report["vms"],
@@ -1177,6 +1223,15 @@ def step(check, default=None):
 
 
 def run_scan():
+    scan_state["running"] = True
+    try:
+        return _run_scan()
+    finally:
+        scan_state["running"] = False
+        scan_state["finished"] = time.time()
+
+
+def _run_scan():
     with lock:
         findings.clear()
         cleanup.clear()
@@ -1215,9 +1270,74 @@ def run_scan():
     return report
 
 
+LAN_SUFFIXES = ("", ".local", ".lan", ".home", ".home.arpa", ".localdomain", ".internal")
+
+
+def allowed_hosts():
+    """Names the report page may be opened by. Anything else is refused, which
+    stops a web page you visit from rebinding its own name to this server."""
+    names = {"localhost"}
+    ident = read_cfg(os.path.join(BOOT, "config/ident.cfg")) or {}
+    for base in (ident.get("NAME", ""), (read(hp("etc/hostname")) or "").strip()):
+        base = base.lower().split(".")[0]
+        if base:
+            names.update(base + suffix for suffix in LAN_SUFFIXES)
+    names.update(h.strip().lower() for h in WEBUI_HOSTS.split(",") if h.strip())
+    return names
+
+
+def host_ok(header, names):
+    import ipaddress
+    header = (header or "").strip().lower()
+    host = header[1:].split("]")[0] if header.startswith("[") else header.split(":")[0]
+    try:
+        ipaddress.ip_address(host)
+        return True  # opened by IP address, so no DNS name to rebind
+    except ValueError:
+        pass
+    if host.endswith(".ts.net"):
+        return True  # Tailscale MagicDNS names are only handed out by Tailscale
+    return host in names or any(n.startswith(".") and host.endswith(n) for n in names)
+
+
+def auth_ok(header):
+    """With WEBUI_TOKEN set, the page asks for it as the password (any user name)."""
+    if not WEBUI_TOKEN:
+        return True
+    import base64
+    kind, _, value = (header or "").partition(" ")
+    if kind.lower() != "basic":
+        return False
+    try:
+        password = base64.b64decode(value.strip()).decode("utf-8").partition(":")[2]
+    except ValueError:
+        return False
+    return hmac.compare_digest(password.encode(), WEBUI_TOKEN.encode())
+
+
+scan_state = {"running": False, "finished": 0.0}
+SERVED = {"index.html", "report.json", "report.csv", "report.md", "icon.png"}
+
+
+def start_rescan():
+    """Start a scan in the background. Returns an error message, or None."""
+    if scan_state["running"]:
+        return None  # already scanning; the page just waits for it
+    wait = RESCAN_COOLDOWN - (time.time() - scan_state["finished"])
+    if wait > 0:
+        return "A scan finished moments ago. Try again in %d seconds." % (wait + 1)
+    scan_state["running"] = True  # set now so a double click doesn't start two
+    threading.Thread(target=step, args=(run_scan,), daemon=True).start()
+    return None
+
+
 def serve(port):
     import functools
     import http.server
+    from urllib.parse import urlsplit
+
+    names = allowed_hosts()
+    warned = set()
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def log_message(self, *args):
@@ -1226,9 +1346,55 @@ def serve(port):
         def end_headers(self):
             # the report is rewritten in place, often within the same second, so never serve a cached copy
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
             super().end_headers()
 
+        def reply(self, code, text="", ctype="text/plain; charset=utf-8"):
+            body = text.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            if code == 401:
+                self.send_header("WWW-Authenticate", 'Basic realm="Investigatarr", charset="UTF-8"')
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def allowed(self):
+            host = self.headers.get("Host", "")
+            if not host_ok(host, names):
+                if host not in warned:
+                    warned.add(host)
+                    print("Refused a request for host '%s'. If that's your own name for this "
+                          "server, add it to WEBUI_HOSTS." % host)
+                self.reply(403, "Open this page by the server's IP address or name.")
+                return False
+            if not auth_ok(self.headers.get("Authorization")):
+                self.reply(401, "This page needs the password set in WEBUI_TOKEN.")
+                return False
+            return True
+
+        def do_GET(self):
+            if not self.allowed():
+                return
+            path = urlsplit(self.path).path
+            if path.rstrip("/").endswith("/api/status"):
+                return self.reply(200, json.dumps({"scanning": scan_state["running"]}),
+                                  "application/json")
+            name = "index.html" if path.endswith("/") else path.rsplit("/", 1)[-1]
+            if name not in SERVED:  # only the report itself, never the logs or a file listing
+                return self.reply(404, "Not found")
+            self.path = "/" + name
+            super().do_GET()
+
+        def do_HEAD(self):
+            self.do_GET()
+
         def do_POST(self):
+            if not self.allowed():
+                return
             # Requiring JSON stops other websites from posting here behind your back
             if not (self.headers.get("Content-Type") or "").startswith("application/json"):
                 return self.send_error(415)
@@ -1245,21 +1411,19 @@ def serve(port):
                        "/api/restore": lambda: restore_item(str(body.get("id"))),
                        "/api/purge": lambda: purge_bin(str(body.get("id")))}
             if path.endswith("/api/dismiss") and isinstance(body.get("key"), str):
-                set_dismissed(body["key"][:500], bool(body.get("dismiss", True)))
+                set_dismissed(body["key"][:4000], bool(body.get("dismiss", True)))
             elif path.endswith("/api/rescan"):
-                run_scan()
+                err = start_rescan()
+                return self.reply(429, err) if err else self.reply(202, "Scanning")
             elif any(path.endswith(a) for a in actions):
+                if scan_state["running"]:
+                    return self.reply(409, "A scan is running. Try again when it finishes.")
                 fn = next(f for a, f in actions.items() if path.endswith(a))
                 try:
                     with lock:
                         fn()
                 except Exception as e:  # report the reason to the page
-                    msg = str(e).encode()
-                    self.send_response(409)
-                    self.send_header("Content-Type", "text/plain")
-                    self.send_header("Content-Length", str(len(msg)))
-                    self.end_headers()
-                    self.wfile.write(msg)
+                    self.reply(409, str(e))
                     run_scan()
                     return
                 run_scan()
@@ -1269,9 +1433,10 @@ def serve(port):
             self.end_headers()
 
     handler = functools.partial(Handler, directory=OUT)
-    httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), handler)
+    httpd = http.server.ThreadingHTTPServer((WEBUI_BIND, port), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    print("Report served on port %d" % port)
+    print("Report served on %s:%d%s" % (WEBUI_BIND, port,
+                                        " (password protected)" if WEBUI_TOKEN else ""))
 
 
 def main():
