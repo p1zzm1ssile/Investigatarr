@@ -13,7 +13,7 @@ A small container that audits an Unraid server and gives it a security score out
 | Management access | Telnet, HTTP-only web UI, UPnP, SSH password logins, SSH on 22 + UPnP, FTP |
 | Shares | Public SMB shares (worse for appdata/system/domains/isos), "Secure" guest-read shares, public NFS, SMBv1/NetBIOS |
 | Docker | Privileged containers, risky capabilities, Docker socket mounts, writable host-system mounts, host networking, running as root, default passwords in env vars |
-| Password reuse | Same secret in several containers, root password reused in a container env var, Samba users sharing a password (values are never written to the report) |
+| Password reuse | Same password in several containers, root password reused in a container env var, Samba users sharing a password (values are never written to the report). API keys copied between apps (e.g. Sonarr's key in Prowlarr) and database passwords shared by a database and its app are expected, so they only count when the same value is also used as a login password |
 | VMs | VNC consoles with no password |
 | UPnP | Unraid's UPnP setting, torrent and sync apps that open router ports themselves (qBittorrent, Deluge, Transmission, Syncthing), and the port forwards your router actually has pointing at the server (asked over UPnP). A forwarded web UI or SSH port is flagged as critical / high |
 | Network | Risky services listening on all interfaces (Telnet, FTP, Docker API 2375, databases, Redis, VNC…) |
@@ -34,6 +34,22 @@ Each finding has a **Dismiss** button. A dismissed finding moves to a *Dismissed
 
 Dismissals are saved in `/output/dismissed.json`, and every dismiss and restore is logged to `/output/dismissed.log`.
 
+## Securing the report page
+
+The report lists your server's weak spots, so keep it to yourself:
+
+- **Web UI password** (`WEBUI_TOKEN`): when set, the page asks for it (any user name). Recommended.
+- **Web UI listen address** (`WEBUI_BIND`): listen on one of the server's IPs instead of all of them, e.g. to keep the page off a guest VLAN.
+- The page only answers when opened by an IP address, the server's own name (`tower`, `tower.local`, `tower.lan`, `tower.home.arpa`…) or a Tailscale `*.ts.net` name. This stops a malicious web page from reaching it through DNS rebinding. If you open it through a reverse proxy or another name, add that name to **Extra web UI host names** (`WEBUI_HOSTS`, comma separated; `.example.com` allows every name under it).
+- Only the report and its exports are served. `dismissed.json`, `recycle.json` and the logs stay in `/output` but are not on the web.
+- The template drops every Linux capability except reading and writing files (`--cap-drop=ALL --cap-add=DAC_READ_SEARCH --cap-add=DAC_OVERRIDE`), blocks privilege escalation and makes the container's own filesystem read-only. If you installed Investigatarr before this was added, paste that line into **Extra Parameters** (advanced view):
+
+  ```
+  --cap-drop=ALL --cap-add=DAC_READ_SEARCH --cap-add=DAC_OVERRIDE --security-opt=no-new-privileges --read-only
+  ```
+
+**Rescan now** starts a scan in the background and the page reloads when it finishes. Rescans are limited to one every 30 seconds.
+
 ## Cleanup
 
 The report also lists clutter, without scoring it:
@@ -51,7 +67,9 @@ To get **Delete** buttons, edit the container and:
 
 1. set **Allow delete** (`ALLOW_DELETE`) to `yes`
 2. set **Shares (for delete)** to `/mnt/user` (mapped to `/rw/mnt/user` in the container)
-3. to remove old containers too, set **Docker socket (for delete)** to `/var/run/docker.sock`
+3. to remove old containers too, either set **Docker socket (for delete)** to `/var/run/docker.sock`, or (safer) point **Docker socket proxy (for delete)** (`DOCKER_HOST`) at a socket proxy
+
+The Docker socket is full control of Docker, which is root on the server. A socket proxy only lets Investigatarr look at and remove containers. For example, install `tecnativa/docker-socket-proxy` with `CONTAINERS=1` and `POST=1`, publish its port on `127.0.0.1:2375` only, and set `DOCKER_HOST` to `tcp://127.0.0.1:2375`. The report lists the proxy as a low finding, as a reminder that it holds the socket.
 
 Every delete asks you to confirm first. Files and folders go to a hidden `.investigatarr-recycle` folder in the same share, and a **Recycle bin** section on the report lets you **Restore** them or **Delete now**. Anything left in the bin is removed for good after `RECYCLE_DAYS` (default 30). Removed containers keep their appdata and can be reinstalled from **Apps > Previous Apps**. Empty folders and shares are removed and recreated on restore. Every action is logged to `/output/deleted.log`.
 
@@ -78,6 +96,9 @@ Open the web UI from the container's icon (port 8088).
 
 ```bash
 docker run -d --name investigatarr --net=host \
+  --cap-drop=ALL --cap-add=DAC_READ_SEARCH --cap-add=DAC_OVERRIDE \
+  --security-opt=no-new-privileges --read-only \
+  -e WEBUI_TOKEN=pick-a-password \
   -v /:/host:ro,rslave \
   -v /mnt/user/appdata/investigatarr:/output \
   ghcr.io/p1zzm1ssile/investigatarr:latest
